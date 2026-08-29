@@ -3,34 +3,39 @@
 # setup_minimax_h3.sh
 #
 # One-shot provisioning of MiniMax H3 (open-weights text-to-video / image-to-video)
-# + LoRA + a public REST API, on a fresh DigitalOcean GPU Droplet.
+# + LoRA + a REST API. Works on a RunPod Pod or a DigitalOcean GPU Droplet.
 #
-# Target OS   : Ubuntu 22.04 / 24.04 with the NVIDIA driver already installed
-#               (DigitalOcean "AI/ML Ready" GPU Droplet image).
-# Target GPU  : NVIDIA RTX 4000 Ada (20 GB) or RTX 6000 Ada (48 GB). The script
-#               auto-detects VRAM and picks a model variant accordingly.
+# Target OS   : Ubuntu 22.04 / 24.04 with NVIDIA drivers already present
+#               (RunPod "PyTorch" template, or DigitalOcean "AI/ML Ready" image).
+# Target GPU  : anything with >= ~20 GB VRAM. Tested target: NVIDIA A40 (48 GB,
+#               RunPod, ~$0.44/hr). The script auto-detects VRAM: >= 44 GB runs
+#               with no offload; 18-44 GB adds --lowvram; below that, --novram.
 #
-# DESIGN FOR YOUR WORKFLOW (create droplet -> work -> destroy droplet):
-#   Everything heavy (Python venv, ComfyUI, ~40 GB of model weights, your LoRAs,
-#   workflows, outputs) is installed under $PERSIST_ROOT. If you attach the SAME
-#   DigitalOcean Volume (block storage) to each new droplet, re-running this
-#   script is near-instant: it only re-checks packages and restarts services.
-#   Without a Volume it still works, it just re-downloads the weights each time.
+# DESIGN FOR YOUR WORKFLOW (create pod -> work -> terminate pod):
+#   Everything heavy (Python venv, ComfyUI, ~40 GB of weights, LoRAs, workflows,
+#   outputs) is installed under $PERSIST_ROOT. Point that at persistent storage
+#   that outlives the pod:
+#     RunPod        -> a Network Volume (mounts at /workspace) - auto-detected
+#     DigitalOcean  -> a Volume under /mnt/volume_* - auto-detected
+#   With persistent storage attached, re-running this script is near-instant:
+#   it only re-checks packages and restarts services. Without it, the weights
+#   are re-downloaded every time.
 #
-# USAGE:
-#   export HF_TOKEN=hf_xxxxxxxx        # HF account that has accepted the H3 licence
-#   export API_KEY='long-random-secret'  # protects your public API
-#   # optional: export PERSIST_ROOT=/mnt/volume_fra1_01
-#   sudo -E bash setup_minimax_h3.sh                 # full setup + start
-#   sudo -E bash setup_minimax_h3.sh --setup-only    # provision, don't start services
-#   sudo -E bash setup_minimax_h3.sh --restart       # just restart services
-#   sudo -E bash setup_minimax_h3.sh --stop          # stop services
-#   sudo -E bash setup_minimax_h3.sh --list-models   # print the remote file list of $HF_REPO
+# USAGE (RunPod: you are already root, no sudo needed):
+#   export HF_TOKEN=hf_xxxxxxxx           # HF account that accepted the H3 licence
+#   export API_KEY='long-random-secret'   # protects your API (sent as X-API-Key)
+#   # optional: export PERSIST_ROOT=/workspace/minimax-h3
+#   bash setup_minimax_h3.sh                 # full setup + start
+#   bash setup_minimax_h3.sh --setup-only    # provision, don't start services
+#   bash setup_minimax_h3.sh --restart       # just restart services
+#   bash setup_minimax_h3.sh --stop          # stop services
+#   bash setup_minimax_h3.sh --list-models   # print the remote file list of $HF_REPO
+#   (on DigitalOcean prefix with  sudo -E  so apt works and env vars survive)
 #
-# NOTE ON LICENCE / REGION: the MiniMax H3 Community Licence currently excludes
-# open-weight deployment in the US, EU, UK and South Korea unless MiniMax grants
-# you individual authorisation. Greece is in the EU. Confirm your authorisation
-# and pick your droplet region accordingly before running this in production.
+# NOTE ON LICENCE / REGION: the MiniMax H3 Community Licence excludes open-weight
+# deployment in the US, EU, UK and South Korea unless MiniMax authorises you
+# (email api@minimax.io). Choose a datacenter outside those regions (e.g. CA/EU
+# -> Canada, or an APAC region) and/or hold authorisation before production use.
 # =============================================================================
 
 set -euo pipefail
@@ -86,13 +91,18 @@ esac
 # ----------------------------- locate persistent storage -------------------
 detect_persist_root() {
   if [[ -n "${PERSIST_ROOT:-}" ]]; then echo "$PERSIST_ROOT"; return; fi
-  # DigitalOcean Volumes mount under /mnt/volume_*
   local v
+  # RunPod Network Volume mounts at /workspace
+  if findmnt -rno TARGET /workspace >/dev/null 2>&1; then echo "/workspace/minimax-h3"; return; fi
+  # DigitalOcean Volumes mount under /mnt/volume_*
   v="$(findmnt -rno TARGET --list 2>/dev/null | grep -E '^/mnt/volume' | head -n1 || true)"
   if [[ -n "$v" ]]; then echo "$v/minimax-h3"; return; fi
   # any other extra mount under /mnt
   v="$(findmnt -rno TARGET --list 2>/dev/null | grep -E '^/mnt/' | head -n1 || true)"
   if [[ -n "$v" ]]; then echo "$v/minimax-h3"; return; fi
+  # RunPod without a Network Volume: /workspace is a plain dir but still the
+  # conventional writable location (it does NOT survive pod termination).
+  if [[ -d /workspace && -w /workspace ]]; then echo "/workspace/minimax-h3"; return; fi
   echo "/opt/minimax-h3"
 }
 
@@ -182,7 +192,7 @@ PY
 fi
 
 # ============================ PROVISIONING ================================
-[[ $EUID -eq 0 ]] || die "run with sudo -E (need apt + the -E keeps HF_TOKEN/API_KEY)"
+[[ $EUID -eq 0 ]] || die "must run as root. RunPod: you already are, just 'bash $0'. DigitalOcean: 'sudo -E bash $0' (-E keeps HF_TOKEN/API_KEY)."
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found — this is not a GPU droplet or the driver is missing"
 
 log "persistent root : $PERSIST_ROOT"
@@ -299,21 +309,36 @@ done
 shopt -u nullglob
 log "LoRAs available: $(ls -1 "$MODELS_DIR/loras" 2>/dev/null | tr '\n' ' ' || echo '(none)')"
 
-# --- 10. drop the API server file --------------------------------
-if [[ -f "$(dirname "$0")/api_server.py" ]]; then
-  cp "$(dirname "$0")/api_server.py" "$APP_DIR/api_server.py"
+# --- 10. drop the API server file + repo-provided workflows ------------
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [[ -f "$SCRIPT_DIR/api_server.py" ]]; then
+  cp "$SCRIPT_DIR/api_server.py" "$APP_DIR/api_server.py"
   log "installed api_server.py into $APP_DIR"
 else
   warn "api_server.py not found next to this script — copy it into $APP_DIR manually"
 fi
 
+# If you commit your exported workflow + map files to the repo under ./workflows/,
+# they get seeded here every run. This is how the one-time ComfyUI export
+# survives when you do NOT use a persistent volume (rebuild-each-session mode):
+# do the export once, `git add workflows/*.json && git commit && git push`, done.
+if [[ -d "$SCRIPT_DIR/workflows" ]]; then
+  shopt -s nullglob
+  for f in "$SCRIPT_DIR"/workflows/*.json; do
+    cp -n "$f" "$WF_DIR/$(basename "$f")"
+  done
+  shopt -u nullglob
+  log "seeded workflows from repo: $(ls -1 "$WF_DIR"/*.json 2>/dev/null | xargs -rn1 basename | tr '\n' ' ')"
+fi
+
 # --- 11. workflow templates -------------------------------------
 # The API server drives ComfyUI with an API-format workflow JSON plus a small
-# mapping file. These are created ONCE and then live on the persistent volume.
+# mapping file. Create them ONCE, then keep them (on a volume, or committed to
+# your repo under ./workflows/ so step 10 re-seeds them every rebuild).
 if [[ ! -f "$WF_DIR/t2v.json" || ! -f "$WF_DIR/i2v.json" ]]; then
   cat > "$WF_DIR/README.txt" <<'TXT'
-ONE-TIME STEP - create the workflow files the API server drives. This folder is
-on your persistent Volume, so you only ever do this once.
+ONE-TIME STEP - create the workflow files the API server drives, then keep them
+somewhere permanent (see step 8) so you never redo this.
 
 Per kind (t2v = text only, i2v = has a reference image) the server looks for:
     <kind>_audio.json   used when the request has audio_enabled=true   (optional)
@@ -323,8 +348,9 @@ If a single <kind>.json can toggle audio internally, add an "audio_enabled"
 entry to <kind>.map.json pointing at that boolean and skip the *_audio.json file.
 
 STEPS
-1. SSH tunnel to the UI:  ssh -L 8188:127.0.0.1:8188 root@<droplet-ip>
-   then open http://127.0.0.1:8188
+1. Open the ComfyUI web UI:
+     RunPod       : https://<POD_ID>-8188.proxy.runpod.net  (Connect > HTTP 8188)
+     DigitalOcean : ssh -L 8188:127.0.0.1:8188 root@<ip>  then  http://127.0.0.1:8188
 2. Workflow > Browse Templates > Video > "MiniMax H3".
      text-to-video : the T2V template.
      image-to-video: the first-frame (FL2VA) template - it has a Load Image node.
@@ -334,11 +360,15 @@ STEPS
      - scheduler = simple, steps >= 4  (API default is 6)
 4. Queue it once to confirm it renders video (and audio, in the audio graph).
 5. Settings (gear) > enable "Dev mode" (adds the "Save (API Format)" button).
-6. "Save (API Format)" into THIS folder as t2v.json / t2v_audio.json /
-   i2v.json / i2v_audio.json as appropriate.
+6. "Save (API Format)" as t2v.json / t2v_audio.json / i2v.json / i2v_audio.json.
 7. Copy t2v.map.json.example -> t2v.map.json (and the i2v pair) and edit the node
    ids / input names to match YOUR saved graph. List only params you want the API
    to control. Node ids are the object keys in the API-format JSON you just saved.
+8. MAKE THEM PERMANENT. Since you rebuild each session with no volume, download
+   all *.json + *.map.json from this folder and commit them into your git repo
+   under  workflows/  :
+       git add workflows/*.json && git commit -m "workflows" && git push
+   Next run, the setup script auto-seeds them back from the repo.
 TXT
   cat > "$WF_DIR/t2v.map.json.example" <<'JSON'
 {
