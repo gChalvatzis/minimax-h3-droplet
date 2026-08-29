@@ -183,11 +183,18 @@ if [[ "$MODE" == "stop" ]]; then stop_services; log "stopped."; exit 0; fi
 if [[ "$MODE" == "restart" ]]; then stop_services; start_comfyui; start_api; exit 0; fi
 if [[ "$MODE" == "list-models" ]]; then
   [[ -x "$VENV/bin/python" ]] || die "run a normal setup first"
-  py - <<PY
+  [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  for r in "$HF_REPO" "${LORA_HF_REPO:-}"; do
+    [[ -n "$r" ]] || continue
+    echo "===== $r ====="
+    "$VENV/bin/python" -c "
 from huggingface_hub import list_repo_files
-for f in sorted(list_repo_files("$HF_REPO")):
-    print(f)
-PY
+try:
+    [print(' ', f) for f in sorted(list_repo_files('$r'))]
+except Exception as e:
+    print('  ERROR:', e)
+"
+  done
   exit 0
 fi
 
@@ -274,34 +281,53 @@ done
 
 # --- 7. API server dependencies ----------------------------------
 log "installing API server dependencies"
-pip install -q fastapi "uvicorn[standard]" httpx python-multipart "huggingface_hub[cli]" pillow
+pip install -q fastapi "uvicorn[standard]" httpx python-multipart "huggingface_hub>=0.34" pillow
 
 # --- 8. model weights ------------------------------------------
-hf_get() {  # <repo> <path-in-repo> <dest-dir>
-  local repo="$1" path="$2" dest="$3" fname
-  fname="$(basename "$path")"
-  if [[ -f "$dest/$fname" ]]; then
-    log "  present: $fname"; return 0
-  fi
-  log "  downloading: $fname"
-  py -m huggingface_hub.commands.huggingface_cli download "$repo" "$path" \
-      --local-dir "$dest" --local-dir-use-symlinks False \
-    || "$VENV/bin/hf" download "$repo" "$path" --local-dir "$dest"
-  # flatten if HF created sub-dirs
-  if [[ ! -f "$dest/$fname" ]]; then
-    found="$(find "$dest" -name "$fname" -type f | head -n1 || true)"
-    [[ -n "$found" ]] && mv "$found" "$dest/$fname"
-  fi
-}
-
-if [[ -z "${HF_TOKEN:-}" ]]; then
-  warn "HF_TOKEN is not set — download of gated H3 weights will fail. Export it and re-run."
+# token for gated repos (all three names are honoured somewhere in the stack)
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
 else
-  "$VENV/bin/hf" auth login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null || \
-    export HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  warn "HF_TOKEN not set — gated H3 weights will 401. Export it and re-run."
 fi
 
-log "fetching model weights from $HF_REPO (this is the slow part on first run)"
+declare -A _RF_CACHE=()
+repo_files() {  # <repo> -> newline-separated repo paths (cached per repo)
+  local repo="$1"
+  if [[ -z "${_RF_CACHE[$repo]+set}" ]]; then
+    _RF_CACHE[$repo]="$("$VENV/bin/python" -c "
+from huggingface_hub import list_repo_files
+import sys
+try:
+    sys.stdout.write('\n'.join(list_repo_files('$repo')))
+except Exception as e:
+    sys.stderr.write('list_repo_files(%s) failed: %s\n' % ('$repo', e))
+" 2>/dev/null)"
+  fi
+  printf '%s\n' "${_RF_CACHE[$repo]}"
+}
+
+MISSING=()
+hf_get() {  # <repo> <wanted-basename> <dest-dir>
+  local repo="$1" want="$2" dest="$3" path=""
+  if [[ -f "$dest/$want" ]]; then log "  present: $want"; return 0; fi
+  path="$(repo_files "$repo" | awk -F/ -v w="$want" '$NF==w{print; exit}')"
+  if [[ -z "$path" ]]; then
+    warn "  NOT in repo $repo: $want"; MISSING+=("$repo :: $want (no such file)"); return 0
+  fi
+  log "  downloading: $repo/$path"
+  if ! "$VENV/bin/hf" download "$repo" "$path" --local-dir "$dest" >/dev/null; then
+    warn "  download failed: $repo/$path"; MISSING+=("$repo :: $path (download error)"); return 0
+  fi
+  # hf preserves repo sub-dirs under dest; expose the file at dest/<want> for ComfyUI
+  if [[ ! -f "$dest/$want" ]]; then
+    local found; found="$(find "$dest" -name "$want" -type f 2>/dev/null | head -n1 || true)"
+    [[ -n "$found" ]] && ln -sf "$found" "$dest/$want"
+  fi
+  [[ -f "$dest/$want" ]] && log "  ok: $want" || { warn "  vanished after download: $want"; MISSING+=("$repo :: $want (post-download)"); }
+}
+
+log "fetching model weights from $HF_REPO (slow part on first run)"
 hf_get "$HF_REPO" "$DIFF_FILE"      "$MODELS_DIR/diffusion_models"
 hf_get "$HF_REPO" "$TEXT_ENCODER"   "$MODELS_DIR/text_encoders"
 hf_get "$HF_REPO" "$VIDEO_VAE"      "$MODELS_DIR/vae"
@@ -318,6 +344,16 @@ for f in "$LORA_STORE"/*.safetensors "$LORA_STORE"/*.pt; do
 done
 shopt -u nullglob
 log "LoRAs available: $(ls -1 "$MODELS_DIR/loras" 2>/dev/null | tr '\n' ' ' || echo '(none)')"
+
+if (( ${#MISSING[@]} )); then
+  warn "----------------------------------------------------------------"
+  warn "could not fetch these files (the configured names are likely wrong):"
+  printf '   - %s\n' "${MISSING[@]}" >&2
+  warn "run:   bash $0 --list-models"
+  warn "then override the *_FILE / TEXT_ENCODER / *_VAE vars at the top of this"
+  warn "script (or via env) with the real basenames and re-run."
+  die "model download incomplete — stopping before starting services."
+fi
 
 # --- 10. drop the API server file + repo-provided workflows ------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
