@@ -195,6 +195,22 @@ fi
 [[ $EUID -eq 0 ]] || die "must run as root. RunPod: you already are, just 'bash $0'. DigitalOcean: 'sudo -E bash $0' (-E keeps HF_TOKEN/API_KEY)."
 command -v nvidia-smi >/dev/null || die "nvidia-smi not found — this is not a GPU droplet or the driver is missing"
 
+# --- 0. single-run lock + robust clone helper ------------------------
+exec 9>"/tmp/minimax_h3_setup.lock" || true
+if command -v flock >/dev/null && ! flock -n 9; then
+  die "another setup_minimax_h3.sh is already running. Wait for it, or: pkill -f setup_minimax_h3.sh"
+fi
+
+git_clone_fresh() {  # <url> <dir> [extra git args]
+  local url="$1" dir="$2"; shift 2
+  if [[ -d "$dir/.git" ]]; then
+    git -C "$dir" pull --ff-only || warn "could not fast-forward $dir (leaving as-is)"
+  else
+    [[ -e "$dir" ]] && { warn "removing stale non-git directory $dir"; rm -rf "$dir"; }
+    git clone --depth 1 "$@" "$url" "$dir"
+  fi
+}
+
 log "persistent root : $PERSIST_ROOT"
 mkdir -p "$PERSIST_ROOT" "$LORA_STORE" "$WF_DIR" "$OUT_DIR" "$RUN_DIR" "$LOG_DIR" "$APP_DIR" \
          "$MODELS_DIR/diffusion_models" "$MODELS_DIR/text_encoders" "$MODELS_DIR/vae" "$MODELS_DIR/loras"
@@ -222,6 +238,9 @@ apt-get install -y -qq git git-lfs curl ffmpeg aria2 build-essential \
 git lfs install --skip-repo >/dev/null 2>&1 || true
 
 # --- 3. python venv -------------------------------------------------
+if [[ -d "$VENV" && ! -x "$VENV/bin/python" ]]; then
+  warn "removing half-built venv at $VENV"; rm -rf "$VENV"
+fi
 if [[ ! -x "$VENV/bin/python" ]]; then
   log "creating venv at $VENV"
   "$PYTHON_BIN" -m venv "$VENV"
@@ -237,13 +256,8 @@ else
 fi
 
 # --- 5. ComfyUI ---------------------------------------------------
-if [[ ! -d "$COMFY_DIR/.git" ]]; then
-  log "cloning ComfyUI"
-  git clone --depth 1 https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
-else
-  log "updating ComfyUI"
-  git -C "$COMFY_DIR" pull --ff-only || warn "could not fast-forward ComfyUI"
-fi
+log "installing/updating ComfyUI"
+git_clone_fresh https://github.com/comfyanonymous/ComfyUI.git "$COMFY_DIR"
 pip install -q -r "$COMFY_DIR/requirements.txt"
 
 # --- 6. custom nodes (video muxing + manager) ----------------------
@@ -253,12 +267,8 @@ declare -A NODES=(
 )
 for name in "${!NODES[@]}"; do
   dir="$COMFY_DIR/custom_nodes/$name"
-  if [[ ! -d "$dir/.git" ]]; then
-    log "installing custom node: $name"
-    git clone --depth 1 "${NODES[$name]}" "$dir"
-  else
-    git -C "$dir" pull --ff-only || true
-  fi
+  log "custom node: $name"
+  git_clone_fresh "${NODES[$name]}" "$dir"
   [[ -f "$dir/requirements.txt" ]] && pip install -q -r "$dir/requirements.txt" || true
 done
 
