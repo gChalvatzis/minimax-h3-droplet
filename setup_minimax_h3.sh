@@ -51,27 +51,26 @@ PYTHON_BIN="${PYTHON_BIN:-python3}"
 # override via env if MiniMax has re-tagged them.
 HF_REPO="${HF_REPO:-Comfy-Org/MiniMax-H3}"
 
-# Model files to fetch:  "<path-in-repo>::<destination-subdir-under-ComfyUI/models>"
-# Two diffusion variants; the script keeps only the one that fits your VRAM.
-DIFF_INT8="${DIFF_INT8:-minimax_h3_fl2va_pruned_int8.safetensors}"          # ~21 GB, for 20-24 GB cards w/ offload or 48 GB comfortably
-DIFF_BF16="${DIFF_BF16:-minimax_h3_fl2va_bf16.safetensors}"                 # full precision, needs a big card
-TEXT_ENCODER="${TEXT_ENCODER:-qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors}"
+# Model file basenames (script resolves their real sub-path from the repo listing).
+# fl2va = first/last-frame -> video+audio; handles BOTH pure text-to-video (no
+# image) and image-to-video (image = first frame). int8_convrot suits Ampere (A40).
+DIFF_INT8="${DIFF_INT8:-minimax_h3_fl2va_pruned_int8_convrot.safetensors}"   # ~21 GB, fits 46 GB w/ sequential load
+DIFF_BF16="${DIFF_BF16:-minimax_h3_fl2va_pruned_bf16.safetensors}"          # full precision fallback
+TEXT_ENCODER="${TEXT_ENCODER:-qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors}" # 4-bit, lightest of the three
 VIDEO_VAE="${VIDEO_VAE:-minimax_h3_video_vae_fp16.safetensors}"
 AUDIO_VAE="${AUDIO_VAE:-minimax_h3_audio_vae_fp32.safetensors}"
 
-# LoRA to auto-download. Default = the community "Turbo" distill LoRA: it renders
-# video + synced audio in ~4-8 sampling steps instead of ~20, which is the single
-# biggest speed win on a 20 GB card that is already offloading to system RAM.
-# Drop any extra .safetensors into $PERSIST_ROOT/loras and they are exposed too.
-LORA_HF_REPO="${LORA_HF_REPO:-larryvrh/MiniMax-H3-Turbo-Lora}"
-LORA_HF_FILE="${LORA_HF_FILE:-minimax_h3_turbo_v4_step600_ema.safetensors}"
+# Turbo LoRA - official ComfyUI-packaged 8-step distill from the SAME repo:
+# renders video + synced audio in ~8 sampling steps instead of ~20.
+LORA_HF_REPO="${LORA_HF_REPO:-Comfy-Org/MiniMax-H3}"
+LORA_HF_FILE="${LORA_HF_FILE:-minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors}"
 
 # API runtime tuning (passed through to api_server.py)
 API_FPS="${API_FPS:-24}"                  # frames-per-second used to turn duration(s) into frame count
 API_MAX_SECONDS="${API_MAX_SECONDS:-15}"  # hard cap on requested clip length
-API_STEPS="${API_STEPS:-6}"               # sampler steps; 6 suits the Turbo LoRA
-API_DEF_W="${API_DEF_W:-848}"             # default width  (20 GB card -> keep modest)
-API_DEF_H="${API_DEF_H:-480}"             # default height
+API_STEPS="${API_STEPS:-8}"               # sampler steps; 8 matches the 8-step Turbo LoRA
+API_DEF_W="${API_DEF_W:-1280}"            # default width  (A40 48 GB handles 720p)
+API_DEF_H="${API_DEF_H:-720}"             # default height
 
 # ----------------------------- helpers --------------------------------------
 log()  { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -184,8 +183,11 @@ if [[ "$MODE" == "restart" ]]; then stop_services; start_comfyui; start_api; exi
 if [[ "$MODE" == "list-models" ]]; then
   [[ -x "$VENV/bin/python" ]] || die "run a normal setup first"
   [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  _seen=""
   for r in "$HF_REPO" "${LORA_HF_REPO:-}"; do
     [[ -n "$r" ]] || continue
+    case "$_seen" in *"|$r|"*) continue;; esac
+    _seen="$_seen|$r|"
     echo "===== $r ====="
     "$VENV/bin/python" -c "
 from huggingface_hub import list_repo_files
