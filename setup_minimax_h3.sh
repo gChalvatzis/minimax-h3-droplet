@@ -43,8 +43,10 @@ set -euo pipefail
 # ----------------------------- configuration ---------------------------------
 COMFY_PORT="${COMFY_PORT:-8188}"          # ComfyUI backend, bound to 127.0.0.1 only
 API_PORT="${API_PORT:-8000}"             # public FastAPI, bound to 0.0.0.0
-TORCH_CUDA="${TORCH_CUDA:-cu124}"        # cu124 wheels match recent DO GPU images
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+# TORCH_INDEX_URL (optional): pin a specific wheel channel, e.g.
+#   https://download.pytorch.org/whl/cu128 . Default = PyPI newest (recommended;
+#   matches the RunPod driver). TORCH_MIN gates the "already installed" check.
 
 # HuggingFace repo that hosts ComfyUI-ready H3 files. VERIFY the filenames below
 # against `sudo -E bash setup_minimax_h3.sh --list-models` on first run and
@@ -257,11 +259,27 @@ fi
 pip install -q --upgrade pip wheel setuptools
 
 # --- 4. PyTorch ---------------------------------------------------
-if ! py -c 'import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)' 2>/dev/null; then
-  log "installing PyTorch ($TORCH_CUDA)"
-  pip install -q torch torchvision torchaudio --index-url "https://download.pytorch.org/whl/$TORCH_CUDA"
+# Current ComfyUI (comfy-kitchen) needs torch >= 2.8. Install the DEFAULT-index
+# build (newest, matches the pod's driver) unless TORCH_INDEX_URL overrides.
+TORCH_MIN="${TORCH_MIN:-2.8}"
+torch_ok() {
+  py - "$TORCH_MIN" <<'PY' 2>/dev/null
+import sys, torch
+def mm(v): p=v.split('+')[0].split('.'); return (int(p[0]), int(p[1]))
+sys.exit(0 if (mm(torch.__version__) >= mm(sys.argv[1]) and torch.cuda.is_available()) else 1)
+PY
+}
+if torch_ok; then
+  log "PyTorch $("$VENV/bin/python" -c 'import torch;print(torch.__version__)') OK (>= $TORCH_MIN, CUDA)"
 else
-  log "PyTorch with CUDA already present"
+  if [[ -n "${TORCH_INDEX_URL:-}" ]]; then
+    log "installing PyTorch from $TORCH_INDEX_URL"
+    pip install -q --upgrade torch torchvision torchaudio --index-url "$TORCH_INDEX_URL"
+  else
+    log "installing/upgrading PyTorch (default index, newest)"
+    pip install -q --upgrade torch torchvision torchaudio
+  fi
+  torch_ok || die "PyTorch still < $TORCH_MIN or CUDA unavailable after install"
 fi
 
 # --- 5. ComfyUI ---------------------------------------------------
@@ -446,9 +464,10 @@ cat <<EOF
   Persistent root : $PERSIST_ROOT
   Diffusion model : $DIFF_FILE   (VRAM ${VRAM_MIB} MiB, comfy flag: '${COMFY_VRAM_FLAG:-none}')
   ComfyUI (local) : http://127.0.0.1:$COMFY_PORT
-  Public API      : http://0.0.0.0:$API_PORT     (protect with the DigitalOcean Cloud Firewall!)
+  Public API      : port $API_PORT  (RunPod HTTP proxy) - protected by the X-API-Key header
 
-  Open ONLY port $API_PORT to your own IP in the DigitalOcean firewall. Do NOT expose $COMFY_PORT.
+  Security: the API on $API_PORT needs a strong API_KEY. Port $COMFY_PORT (ComfyUI) has
+  NO auth - only expose it for the one-time workflow export, don't share that URL.
 EOF
 
 mkdir -p "$RUN_DIR"
