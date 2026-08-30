@@ -123,11 +123,16 @@ pip() { "$VENV/bin/python" -m pip "$@"; }
 
 # ----------------------------- service control ----------------------------
 stop_services() {
+  local name pidf pid
   for name in api comfyui; do
-    local pidf="$RUN_DIR/$name.pid"
-    [[ -f "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null; rm -f "$pidf"; }
+    pidf="$RUN_DIR/$name.pid"
+    if [[ -f "$pidf" ]]; then
+      pid="$(cat "$pidf" 2>/dev/null || true)"
+      if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || true; fi
+      rm -f "$pidf" || true
+    fi
   done
-  # some nohup builds fork, so the pidfile can point at a dead wrapper while the
+  # some nohup builds fork, so a pidfile can point at a dead wrapper while the
   # real listener lives on - kill by command signature too.
   pkill -f "uvicorn api_server:app" 2>/dev/null || true
   pkill -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" 2>/dev/null || true
@@ -135,6 +140,7 @@ stop_services() {
   pkill -9 -f "uvicorn api_server:app" 2>/dev/null || true
   pkill -9 -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" 2>/dev/null || true
   sleep 1
+  return 0
 }
 
 start_comfyui() {
@@ -151,8 +157,8 @@ start_comfyui() {
   log "waiting for ComfyUI to answer ..."
   for _ in $(seq 1 120); do
     if curl -fsS "http://127.0.0.1:$COMFY_PORT/system_stats" >/dev/null 2>&1; then
-      pgrep -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" | head -1 > "$RUN_DIR/comfyui.pid"
-      log "ComfyUI is up (pid $(cat "$RUN_DIR/comfyui.pid"))"; return 0
+      { pgrep -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" | head -1 || true; } > "$RUN_DIR/comfyui.pid"
+      log "ComfyUI is up (pid $(cat "$RUN_DIR/comfyui.pid" 2>/dev/null))"; return 0
     fi
     sleep 2
   done
@@ -182,9 +188,12 @@ start_api() {
     curl -fsS "http://127.0.0.1:$API_PORT/healthz" >/dev/null 2>&1 && break
     sleep 1
   done
-  pgrep -f "uvicorn api_server:app" | head -1 > "$RUN_DIR/api.pid"
-  curl -fsS "http://127.0.0.1:$API_PORT/healthz" >/dev/null 2>&1 \
-    && log "API is up (pid $(cat "$RUN_DIR/api.pid"))" || warn "API health check failed — see $LOG_DIR/api.log"
+  { pgrep -f "uvicorn api_server:app" | head -1 || true; } > "$RUN_DIR/api.pid"
+  if curl -fsS "http://127.0.0.1:$API_PORT/healthz" >/dev/null 2>&1; then
+    log "API is up (pid $(cat "$RUN_DIR/api.pid" 2>/dev/null))"
+  else
+    warn "API health check failed — see $LOG_DIR/api.log"
+  fi
 }
 
 # ----------------------------- early exits --------------------------------
