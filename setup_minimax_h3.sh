@@ -328,34 +328,37 @@ except Exception as e:
 }
 
 MISSING=()
-hf_get() {  # <repo> <wanted-basename> <dest-dir>
-  local repo="$1" want="$2" dest="$3" path=""
-  if [[ -f "$dest/$want" ]]; then log "  present: $want"; return 0; fi
+# The Comfy-Org/MiniMax-H3 repo paths (diffusion_models/, text_encoders/, vae/,
+# loras/, embeddings/) already match ComfyUI's models/ layout, so download into
+# $MODELS_DIR preserving the repo path - no flattening, no symlinks.
+hf_get() {  # <repo> <wanted-basename>
+  local repo="$1" want="$2" path dest sz
   path="$(repo_files "$repo" | awk -F/ -v w="$want" '$NF==w{print; exit}')"
   if [[ -z "$path" ]]; then
     warn "  NOT in repo $repo: $want"; MISSING+=("$repo :: $want (no such file)"); return 0
   fi
+  dest="$MODELS_DIR/$path"
+  sz="$(stat -c%s "$dest" 2>/dev/null || echo 0)"
+  if [[ -f "$dest" && "$sz" -gt 1000000 ]]; then log "  present: $path"; return 0; fi
   log "  downloading: $repo/$path"
-  if ! "$VENV/bin/hf" download "$repo" "$path" --local-dir "$dest" >/dev/null; then
+  if ! "$VENV/bin/hf" download "$repo" "$path" --local-dir "$MODELS_DIR" >/dev/null; then
     warn "  download failed: $repo/$path"; MISSING+=("$repo :: $path (download error)"); return 0
   fi
-  # hf preserves repo sub-dirs under dest; expose the file at dest/<want> for ComfyUI
-  if [[ ! -f "$dest/$want" ]]; then
-    local found; found="$(find "$dest" -name "$want" -type f 2>/dev/null | head -n1 || true)"
-    [[ -n "$found" ]] && ln -sf "$found" "$dest/$want"
-  fi
-  [[ -f "$dest/$want" ]] && log "  ok: $want" || { warn "  vanished after download: $want"; MISSING+=("$repo :: $want (post-download)"); }
+  [[ -f "$dest" ]] && log "  ok: $path" || { warn "  missing after download: $dest"; MISSING+=("$repo :: $path"); }
 }
 
 log "fetching model weights from $HF_REPO (slow part on first run)"
-hf_get "$HF_REPO" "$DIFF_FILE"      "$MODELS_DIR/diffusion_models"
-hf_get "$HF_REPO" "$TEXT_ENCODER"   "$MODELS_DIR/text_encoders"
-hf_get "$HF_REPO" "$VIDEO_VAE"      "$MODELS_DIR/vae"
-hf_get "$HF_REPO" "$AUDIO_VAE"      "$MODELS_DIR/vae"
+hf_get "$HF_REPO" "$DIFF_FILE"
+hf_get "$HF_REPO" "$TEXT_ENCODER"
+hf_get "$HF_REPO" "$VIDEO_VAE"
+hf_get "$HF_REPO" "$AUDIO_VAE"
 
 # --- 9. LoRAs -------------------------------------------------
 if [[ -n "$LORA_HF_REPO" && -n "$LORA_HF_FILE" ]]; then
-  hf_get "$LORA_HF_REPO" "$LORA_HF_FILE" "$LORA_STORE"
+  hf_get "$LORA_HF_REPO" "$LORA_HF_FILE"
+  # if the LoRA repo stores it outside a loras/ path, link it into models/loras
+  _lp="$(find "$MODELS_DIR" -name "$LORA_HF_FILE" -type f 2>/dev/null | head -n1 || true)"
+  [[ -n "$_lp" && ! -e "$MODELS_DIR/loras/$LORA_HF_FILE" ]] && ln -sf "$_lp" "$MODELS_DIR/loras/$LORA_HF_FILE"
 fi
 # expose every LoRA kept on the persistent volume to ComfyUI
 shopt -s nullglob
