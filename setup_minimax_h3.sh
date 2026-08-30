@@ -41,8 +41,12 @@
 set -euo pipefail
 
 # ----------------------------- configuration ---------------------------------
-COMFY_PORT="${COMFY_PORT:-8188}"          # ComfyUI backend, bound to 127.0.0.1 only
-API_PORT="${API_PORT:-8000}"             # public FastAPI, bound to 0.0.0.0
+COMFY_PORT="${COMFY_PORT:-8188}"          # ComfyUI backend
+API_PORT="${API_PORT:-8000}"             # public FastAPI
+# ComfyUI bind address. RunPod's HTTP proxy can only reach 0.0.0.0, so default to
+# that (you need the 8188 proxy URL for the one-time workflow export). It has NO
+# auth - don't share that URL. Set COMFY_LISTEN=127.0.0.1 to keep it SSH-only.
+COMFY_LISTEN="${COMFY_LISTEN:-0.0.0.0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 # TORCH_INDEX_URL (optional): pin a specific wheel channel, e.g.
 #   https://download.pytorch.org/whl/cu128 . Default = PyPI newest (recommended;
@@ -135,10 +139,10 @@ stop_services() {
   # some nohup builds fork, so a pidfile can point at a dead wrapper while the
   # real listener lives on - kill by command signature too.
   pkill -f "uvicorn api_server:app" 2>/dev/null || true
-  pkill -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" 2>/dev/null || true
+  pkill -f "main.py --listen ${COMFY_LISTEN} --port ${COMFY_PORT}" 2>/dev/null || true
   sleep 2
   pkill -9 -f "uvicorn api_server:app" 2>/dev/null || true
-  pkill -9 -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" 2>/dev/null || true
+  pkill -9 -f "main.py --listen ${COMFY_LISTEN} --port ${COMFY_PORT}" 2>/dev/null || true
   sleep 1
   return 0
 }
@@ -151,13 +155,13 @@ start_comfyui() {
   log "starting ComfyUI on 127.0.0.1:$COMFY_PORT  (extra: '${COMFY_EXTRA_ARGS:-none}')"
   # shellcheck disable=SC2086  (COMFY_EXTRA_ARGS is intentionally word-split: e.g. "--lowvram")
   ( cd "$COMFY_DIR" && nohup "$VENV/bin/python" main.py \
-        --listen 127.0.0.1 --port "$COMFY_PORT" \
+        --listen "$COMFY_LISTEN" --port "$COMFY_PORT" \
         --output-directory "$OUT_DIR" ${COMFY_EXTRA_ARGS:-} \
         > "$LOG_DIR/comfyui.log" 2>&1 & echo $! > "$RUN_DIR/comfyui.pid" )
   log "waiting for ComfyUI to answer ..."
   for _ in $(seq 1 120); do
     if curl -fsS "http://127.0.0.1:$COMFY_PORT/system_stats" >/dev/null 2>&1; then
-      { pgrep -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" | head -1 || true; } > "$RUN_DIR/comfyui.pid"
+      { pgrep -f "main.py --listen ${COMFY_LISTEN} --port ${COMFY_PORT}" | head -1 || true; } > "$RUN_DIR/comfyui.pid"
       log "ComfyUI is up (pid $(cat "$RUN_DIR/comfyui.pid" 2>/dev/null))"; return 0
     fi
     sleep 2
