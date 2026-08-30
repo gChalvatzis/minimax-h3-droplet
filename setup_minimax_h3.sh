@@ -125,13 +125,16 @@ pip() { "$VENV/bin/python" -m pip "$@"; }
 stop_services() {
   for name in api comfyui; do
     local pidf="$RUN_DIR/$name.pid"
-    if [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf")" 2>/dev/null; then
-      log "stopping $name (pid $(cat "$pidf"))"
-      kill "$(cat "$pidf")" 2>/dev/null || true
-      sleep 2; kill -9 "$(cat "$pidf")" 2>/dev/null || true
-    fi
-    rm -f "$pidf"
+    [[ -f "$pidf" ]] && { kill "$(cat "$pidf")" 2>/dev/null; rm -f "$pidf"; }
   done
+  # some nohup builds fork, so the pidfile can point at a dead wrapper while the
+  # real listener lives on - kill by command signature too.
+  pkill -f "uvicorn api_server:app" 2>/dev/null || true
+  pkill -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" 2>/dev/null || true
+  sleep 2
+  pkill -9 -f "uvicorn api_server:app" 2>/dev/null || true
+  pkill -9 -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" 2>/dev/null || true
+  sleep 1
 }
 
 start_comfyui() {
@@ -146,9 +149,10 @@ start_comfyui() {
         --output-directory "$OUT_DIR" ${COMFY_EXTRA_ARGS:-} \
         > "$LOG_DIR/comfyui.log" 2>&1 & echo $! > "$RUN_DIR/comfyui.pid" )
   log "waiting for ComfyUI to answer ..."
-  for _ in $(seq 1 90); do
+  for _ in $(seq 1 120); do
     if curl -fsS "http://127.0.0.1:$COMFY_PORT/system_stats" >/dev/null 2>&1; then
-      log "ComfyUI is up"; return 0
+      pgrep -f "main.py --listen 127.0.0.1 --port ${COMFY_PORT}" | head -1 > "$RUN_DIR/comfyui.pid"
+      log "ComfyUI is up (pid $(cat "$RUN_DIR/comfyui.pid"))"; return 0
     fi
     sleep 2
   done
@@ -174,9 +178,13 @@ start_api() {
     nohup "$VENV/bin/python" -m uvicorn api_server:app \
         --host 0.0.0.0 --port "$API_PORT" \
         > "$LOG_DIR/api.log" 2>&1 & echo $! > "$RUN_DIR/api.pid" )
-  sleep 3
+  for _ in $(seq 1 20); do
+    curl -fsS "http://127.0.0.1:$API_PORT/healthz" >/dev/null 2>&1 && break
+    sleep 1
+  done
+  pgrep -f "uvicorn api_server:app" | head -1 > "$RUN_DIR/api.pid"
   curl -fsS "http://127.0.0.1:$API_PORT/healthz" >/dev/null 2>&1 \
-    && log "API is up" || warn "API health check failed — see $LOG_DIR/api.log"
+    && log "API is up (pid $(cat "$RUN_DIR/api.pid"))" || warn "API health check failed — see $LOG_DIR/api.log"
 }
 
 # ----------------------------- early exits --------------------------------
