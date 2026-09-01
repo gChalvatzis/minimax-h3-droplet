@@ -242,11 +242,22 @@ def list_loras(x_api_key: Optional[str] = Header(None)):
     return {"loras": loras, "default": DEFAULT_LORA}
 
 
+ASPECT_RATIOS = {
+    "1:1": "1:1 (Square)", "2:3": "2:3 (Portrait Photo)", "3:2": "3:2 (Photo)",
+    "3:4": "3:4 (Portrait Standard)", "4:3": "4:3 (Standard)",
+    "9:16": "9:16 (Portrait Widescreen)", "16:9": "16:9 (Widescreen)",
+    "21:9": "21:9 (Ultrawide)",
+}
+_ASPECT_FULL = set(ASPECT_RATIOS.values())
+
+
 @app.post("/v1/videos")
 async def create_video(
     prompt: str = Form(...),
     duration: float = Form(6.0),
     audio_enabled: bool = Form(True),
+    aspect_ratio: str = Form("16:9"),
+    megapixels: float = Form(0.9),
     negative: Optional[str] = Form(None),
     width: int = Form(DEFAULT_WIDTH),
     height: int = Form(DEFAULT_HEIGHT),
@@ -263,6 +274,11 @@ async def create_video(
     if duration <= 0 or duration > MAX_SECONDS:
         raise HTTPException(422, f"duration must be in (0, {MAX_SECONDS}] seconds "
                                  f"(H3 open weights cap short clips; raise MAX_SECONDS to override)")
+    ar = ASPECT_RATIOS.get(aspect_ratio.strip(), aspect_ratio.strip())
+    if ar not in _ASPECT_FULL:
+        raise HTTPException(422, f"aspect_ratio must be one of {sorted(ASPECT_RATIOS)} "
+                                 f"(or the full label). got {aspect_ratio!r}")
+    megapixels = max(0.1, min(2.0, megapixels))
 
     img_bytes = await reference_image.read() if reference_image is not None else None
     if reference_image is not None and not img_bytes:
@@ -273,6 +289,7 @@ async def create_video(
     resolved = {
         "kind": kind, "audio_enabled": audio_enabled,
         "duration_s": duration, "fps": FPS, "frames": frames,
+        "aspect_ratio": ar, "megapixels": megapixels,
         "width": _round16(width), "height": _round16(height),
         "steps": steps, "lora": lora or DEFAULT_LORA, "lora_strength": lora_strength,
     }
@@ -280,6 +297,8 @@ async def create_video(
         "prompt": prompt,
         "negative": negative,
         "duration": duration,
+        "aspect_ratio": ar,
+        "megapixels": megapixels,
         "frames": frames,
         "fps": FPS,
         "width": resolved["width"],

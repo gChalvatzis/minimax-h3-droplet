@@ -3,6 +3,8 @@
   "prompt":        {"node": "105:104", "input": "prompt"},
   "seed":          {"node": "105:15",  "input": "noise_seed"},
   "duration":      {"node": "105:111", "input": "value"},
+  "aspect_ratio":  {"node": "115", "input": "aspect_ratio"},
+  "megapixels":    {"node": "115", "input": "megapixels"},
   "steps":         {"node": "105:125", "input": "value"},
   "lora":          {"node": "105:121", "input": "lora_name"},
   "lora_strength": {"node": "105:121", "input": "strength_model"},
