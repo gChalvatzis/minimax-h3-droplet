@@ -126,11 +126,14 @@ def _apply(graph: dict, mapping: dict, params: dict[str, Any]) -> dict:
     for name, value in params.items():
         if value is None or name not in mapping:
             continue
-        tgt = mapping[name]
-        nid, key = str(tgt["node"]), tgt["input"]
-        if nid not in g:
-            raise HTTPException(500, f"{name}: mapping node {nid} is not in the workflow graph")
-        g[nid].setdefault("inputs", {})[key] = value
+        targets = mapping[name]
+        if isinstance(targets, dict):          # one node, or a list of nodes
+            targets = [targets]
+        for tgt in targets:
+            nid, key = str(tgt["node"]), tgt["input"]
+            if nid not in g:
+                raise HTTPException(500, f"{name}: mapping node {nid} is not in the workflow graph")
+            g[nid].setdefault("inputs", {})[key] = value
     return g
 
 
@@ -276,6 +279,7 @@ async def create_video(
     params = {
         "prompt": prompt,
         "negative": negative,
+        "duration": duration,
         "frames": frames,
         "fps": FPS,
         "width": resolved["width"],

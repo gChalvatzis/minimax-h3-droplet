@@ -1,0 +1,10 @@
+{
+  "_comment": "MiniMax H3 image-to-video (subgraph-flattened export). turbo LoRA + 8 steps are baked into the graph (nodes 105:126 / 105:125 / 105:121). Audio is always on. Aspect ratio is fixed by node 115 (currently 1:1) - change it in ComfyUI + re-export for widescreen.",
+  "prompt":        {"node": "105:104", "input": "prompt"},
+  "seed":          {"node": "105:15",  "input": "noise_seed"},
+  "duration":      {"node": "105:111", "input": "value"},
+  "steps":         {"node": "105:125", "input": "value"},
+  "lora":          {"node": "105:121", "input": "lora_name"},
+  "lora_strength": {"node": "105:121", "input": "strength_model"},
+  "image":         {"node": "114", "input": "image"}
+}
