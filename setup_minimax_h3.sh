@@ -145,11 +145,14 @@ r2_env() {
     [[ -n "${!v:-}" ]] || miss="$miss $v"
   done
   [[ -z "$miss" ]] || { warn "R2 not configured, missing:$miss"; return 1; }
-  export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
+  # provider=Other (not "Cloudflare" - older rclone rejects that); no_check_bucket
+  # because an R2 "Object Read & Write" token can't list/create buckets (was 403).
+  export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Other \
     RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
     RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
     RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
-    RCLONE_CONFIG_R2_REGION=auto
+    RCLONE_CONFIG_R2_REGION=auto \
+    RCLONE_CONFIG_R2_NO_CHECK_BUCKET=true
 }
 _apt_have() { command -v "$1" >/dev/null || { apt-get update -qq && apt-get install -y -qq "$2"; }; }
 ensure_rclone() {
