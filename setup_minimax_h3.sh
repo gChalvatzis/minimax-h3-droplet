@@ -30,6 +30,9 @@
 #   bash setup_minimax_h3.sh --restart       # just restart services
 #   bash setup_minimax_h3.sh --stop          # stop services
 #   bash setup_minimax_h3.sh --list-models   # print the remote file list of $HF_REPO
+#   bash setup_minimax_h3.sh --snapshot      # tar /workspace/minimax-h3 -> Cloudflare R2
+#   bash setup_minimax_h3.sh --restore       # pull that tarball, then start services
+#                                            #   (needs R2_* env vars; ~10 min vs ~40)
 #   (on DigitalOcean prefix with  sudo -E  so apt works and env vars survive)
 #
 # NOTE ON LICENCE / REGION: the MiniMax H3 Community Licence excludes open-weight
@@ -83,12 +86,22 @@ log()  { printf '\033[1;36m[%s]\033[0m %s\n' "$(date +%H:%M:%S)" "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[fail]\033[0m %s\n' "$*" >&2; exit 1; }
 
+# --- fast rebuild via Cloudflare R2 (optional) -----------------------------
+# Set in the pod template:  R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET
+# Then:  bash setup_minimax_h3.sh --snapshot   (once, after a good full build)
+#        bash setup_minimax_h3.sh --restore    (every later pod - pulls the tarball
+#                                               instead of a 40-min rebuild)
+# SNAPSHOT_ON_SUCCESS=1 auto-uploads a fresh snapshot after a successful full build.
+SNAPSHOT_KEY="${SNAPSHOT_KEY:-minimax-h3.tar.zst}"
+
 MODE="full"
 case "${1:-}" in
   --setup-only) MODE="setup-only" ;;
   --restart)    MODE="restart" ;;
   --stop)       MODE="stop" ;;
   --list-models) MODE="list-models" ;;
+  --snapshot)   MODE="snapshot" ;;
+  --restore)    MODE="restore" ;;
   "" )          MODE="full" ;;
   *) die "unknown argument: $1" ;;
 esac
@@ -124,6 +137,54 @@ APP_DIR="$PERSIST_ROOT/app"           # holds api_server.py
 
 py() { "$VENV/bin/python" "$@"; }
 pip() { "$VENV/bin/python" -m pip "$@"; }
+
+# ----------------------------- R2 snapshot / restore ---------------------
+r2_env() {
+  local v miss=""
+  for v in R2_ACCOUNT_ID R2_ACCESS_KEY_ID R2_SECRET_ACCESS_KEY R2_BUCKET; do
+    [[ -n "${!v:-}" ]] || miss="$miss $v"
+  done
+  [[ -z "$miss" ]] || { warn "R2 not configured, missing:$miss"; return 1; }
+  export RCLONE_CONFIG_R2_TYPE=s3 RCLONE_CONFIG_R2_PROVIDER=Cloudflare \
+    RCLONE_CONFIG_R2_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID" \
+    RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY" \
+    RCLONE_CONFIG_R2_ENDPOINT="https://${R2_ACCOUNT_ID}.r2.cloudflarestorage.com" \
+    RCLONE_CONFIG_R2_REGION=auto
+}
+_apt_have() { command -v "$1" >/dev/null || { apt-get update -qq && apt-get install -y -qq "$2"; }; }
+ensure_rclone() {
+  command -v rclone >/dev/null && return 0
+  _apt_have unzip unzip
+  log "installing rclone"
+  curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip -o /tmp/rclone.zip
+  ( cd /tmp && unzip -oq rclone.zip && cp rclone-*-linux-amd64/rclone /usr/local/bin/rclone && chmod +x /usr/local/bin/rclone )
+  command -v rclone >/dev/null || die "rclone install failed"
+}
+do_snapshot() {
+  r2_env || return 1
+  ensure_rclone; _apt_have zstd zstd
+  [[ -x "$VENV/bin/python" && -d "$COMFY_DIR/models" ]] || die "nothing to snapshot — run a full build first"
+  local dst="R2:${R2_BUCKET}/${SNAPSHOT_KEY}"
+  log "snapshot $PERSIST_ROOT -> $dst  (~40 GB, several minutes)"
+  tar -c -C "$PERSIST_ROOT" \
+      --exclude=./logs --exclude=./outputs --exclude=./run --exclude=./tmp \
+      --exclude='*/.cache' --exclude='*/__pycache__' --exclude='*.pyc' . \
+    | zstd -3 -T0 \
+    | rclone rcat --s3-chunk-size 128M --s3-upload-concurrency 8 --stats 30s "$dst"
+  log "snapshot done: $dst"
+}
+do_restore() {
+  r2_env || return 1
+  ensure_rclone; _apt_have zstd zstd
+  local src="R2:${R2_BUCKET}/${SNAPSHOT_KEY}"
+  rclone lsjson "$src" >/dev/null 2>&1 || { warn "no snapshot at $src — falling back to full build"; return 1; }
+  log "restore $src -> $PERSIST_ROOT  (several minutes)"
+  mkdir -p "$PERSIST_ROOT"
+  rclone cat --stats 30s "$src" | zstd -d | tar -x -C "$PERSIST_ROOT"
+  [[ -x "$VENV/bin/python" && -d "$COMFY_DIR/models" ]] \
+    || { warn "restore incomplete — full build will fill the gaps"; return 1; }
+  log "restore complete — running a quick pass to (re)start services"
+}
 
 # ----------------------------- service control ----------------------------
 stop_services() {
@@ -203,6 +264,15 @@ start_api() {
 # ----------------------------- early exits --------------------------------
 if [[ "$MODE" == "stop" ]]; then stop_services; log "stopped."; exit 0; fi
 if [[ "$MODE" == "restart" ]]; then stop_services; start_comfyui; start_api; exit 0; fi
+if [[ "$MODE" == "snapshot" ]]; then
+  [[ $EUID -eq 0 ]] || die "run as root"
+  do_snapshot; exit $?
+fi
+if [[ "$MODE" == "restore" ]]; then
+  [[ $EUID -eq 0 ]] || die "run as root"
+  do_restore || true      # on any failure just continue into a normal full build
+  MODE="full"
+fi
 if [[ "$MODE" == "list-models" ]]; then
   [[ -x "$VENV/bin/python" ]] || die "run a normal setup first"
   [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
@@ -265,7 +335,7 @@ fi
 log "installing system packages"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq git git-lfs curl ffmpeg aria2 build-essential \
+apt-get install -y -qq git git-lfs curl ffmpeg aria2 build-essential zstd unzip \
                       python3-venv python3-dev pkg-config >/dev/null
 git lfs install --skip-repo >/dev/null 2>&1 || true
 
@@ -529,3 +599,8 @@ Ready. One public endpoint, always multipart/form-data.
   duration is in SECONDS, capped at $API_MAX_SECONDS (raise API_MAX_SECONDS to override).
   Logs: $LOG_DIR/comfyui.log , $LOG_DIR/api.log
 EOF
+
+if [[ "${SNAPSHOT_ON_SUCCESS:-0}" == "1" ]]; then
+  log "SNAPSHOT_ON_SUCCESS=1 -> uploading snapshot to R2"
+  do_snapshot || warn "snapshot failed (services are still up)"
+fi
