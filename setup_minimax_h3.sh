@@ -181,12 +181,39 @@ do_restore() {
   ensure_rclone; _apt_have zstd zstd
   local src="R2:${R2_BUCKET}/${SNAPSHOT_KEY}"
   rclone lsjson "$src" >/dev/null 2>&1 || { warn "no snapshot at $src — falling back to full build"; return 1; }
-  log "restore $src -> $PERSIST_ROOT  (several minutes)"
   mkdir -p "$PERSIST_ROOT"
-  rclone cat --stats 30s "$src" | zstd -d | tar -x -C "$PERSIST_ROOT"
-  [[ -x "$VENV/bin/python" && -d "$COMFY_DIR/models" ]] \
-    || { warn "restore incomplete — full build will fill the gaps"; return 1; }
-  log "restore complete — running a quick pass to (re)start services"
+  local tmp="${PERSIST_ROOT}.download.tar.zst"
+  local attempt
+  # Download to a real file (not a bare stream) so a mid-transfer network hiccup
+  # can be retried/resumed instead of silently truncating the tar. rclone's
+  # multi-thread chunked download retries failed chunks within one attempt;
+  # the outer loop retries the whole file a few times for anything worse.
+  for attempt in 1 2 3; do
+    log "restore attempt $attempt/3: downloading $src -> $tmp"
+    if rclone copyto \
+         --retries 10 --low-level-retries 20 --retries-sleep 5s \
+         --multi-thread-streams 4 --multi-thread-cutoff 64M \
+         --stats 30s --stats-one-line \
+         "$src" "$tmp"; then
+      log "download OK ($(du -h "$tmp" 2>/dev/null | cut -f1)), extracting"
+      if zstd -dc "$tmp" | tar -x -C "$PERSIST_ROOT"; then
+        rm -f "$tmp"
+        if [[ -x "$VENV/bin/python" && -d "$COMFY_DIR/models" ]]; then
+          log "restore complete — running a quick pass to (re)start services"
+          return 0
+        fi
+        warn "extracted but looks incomplete (attempt $attempt)"
+      else
+        warn "extraction failed (attempt $attempt) — archive may be truncated"
+      fi
+    else
+      warn "download failed (attempt $attempt)"
+    fi
+    rm -f "$tmp"
+    sleep 5
+  done
+  warn "restore failed after 3 attempts — falling back to full build"
+  return 1
 }
 
 # ----------------------------- service control ----------------------------
