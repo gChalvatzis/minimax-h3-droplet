@@ -305,7 +305,7 @@ if [[ "$MODE" == "restore" ]]; then
 fi
 if [[ "$MODE" == "list-models" ]]; then
   [[ -x "$VENV/bin/python" ]] || die "run a normal setup first"
-  [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  [[ -n "${HF_TOKEN:-}" ]] && export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" HF_HUB_DISABLE_XET=1
   _seen=""
   for r in "$HF_REPO" "${LORA_HF_REPO:-}"; do
     [[ -n "$r" ]] || continue
@@ -423,11 +423,15 @@ done
 # --- 7. API server dependencies ----------------------------------
 log "installing API server dependencies"
 pip install -q fastapi "uvicorn[standard]" httpx python-multipart "huggingface_hub>=0.34" pillow
+# hf_xet's chunked-reconstruction writer errors out on this network filesystem
+# ("Internal Writer Error: Failed to send data: receiver dropped") - HF_HUB_DISABLE_XET
+# alone isn't always enough once the package is present, so remove it outright.
+pip uninstall -y hf_xet hf-xet >/dev/null 2>&1 || true
 
 # --- 8. model weights ------------------------------------------
 # token for gated repos (all three names are honoured somewhere in the stack)
 if [[ -n "${HF_TOKEN:-}" ]]; then
-  export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN"
+  export HF_TOKEN HF_HUB_TOKEN="$HF_TOKEN" HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" HF_HUB_DISABLE_XET=1
 else
   warn "HF_TOKEN not set — gated H3 weights will 401. Export it and re-run."
 fi
